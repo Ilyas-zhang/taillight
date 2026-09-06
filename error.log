@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "Z:\proj\taillight\user\gesture_detect\CVideo.py", line 29, in <module>
+    ser = serial.Serial(
+AttributeError: module 'serial' has no attribute 'Serial'
