@@ -1,0 +1,22 @@
+{
+  "actions": [
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "good",
+    "not good",
+    "ok",
+    "125",
+    "235"
+  ],
+  "frames_per_action": 500,
+  "epochs": 80,
+  "model_path": "Model/action.h5"
+}
