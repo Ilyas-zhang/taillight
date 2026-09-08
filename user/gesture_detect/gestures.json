@@ -12,11 +12,9 @@
     "ten",
     "good",
     "not good",
-    "ok",
-    "125",
-    "235"
+    "ok"
   ],
   "frames_per_action": 500,
   "epochs": 80,
-  "model_path": "Model/action.h5"
+  "model_path": "Model/action_13.h5"
 }

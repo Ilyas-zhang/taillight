@@ -4,6 +4,7 @@ tensorflow==2.15.0
 numpy==1.26.4
 scikit-learn
 PySimpleGUI==4.60.5.1
+pyserial>=3.5
 comtypes
 pycaw
 PyAudio
