@@ -1,0 +1,7 @@
+{
+  "ok_dist_threshold": 0.25,
+  "finger_debounce_window": 5,
+  "finger_debounce_threshold": 3,
+  "value_stable_need": 3,
+  "smoother_alpha": 0.3
+}

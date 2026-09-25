@@ -1,3 +1,11 @@
+"""
+  ============ CVideo.py ============
+  PC 端手势检测主程序：摄像头画面 → MediaPipe 手部检测 → 二进制手指计数
+  → UART 发送 → MCU LED 显示。
+
+  PC-side gesture detection main app: camera → MediaPipe hand detection
+  → binary finger counting → UART send → MCU LED display.
+"""
 import sys
 import traceback
 
@@ -8,29 +16,24 @@ def excepthook(exc_type, exc_value, exc_tb):
     traceback.print_exception(exc_type, exc_value, exc_tb)
 sys.excepthook = excepthook
 
-# -*- coding:utf-8 -*-
-from collections import deque
 import cv2
 import numpy as np
 import os
 import PySimpleGUI as sg
 import datetime
-import tensorflow as tf
 import serial
 import serial.tools.list_ports
 import time
 
 from hand import Detector
-from gestures_config import load_config
-from landmarks import LandmarkSmoother, select_primary_hand
+from config import load_config
+from landmarks import (LandmarkSmoother, select_primary_hand,
+                        get_finger_states, detect_ok_gesture, FingerDebouncer)
 
 
 class SGCV:
     def __init__(self) -> None:
-        print("[DEBUG] SGCV.__init__ 开始")
-
         self.video_path = os.path.join(os.getcwd(), 'videos')
-        print(f"[DEBUG] video_path = {self.video_path}")
         if not os.path.isdir(self.video_path):
             os.mkdir(self.video_path)
 
@@ -79,41 +82,29 @@ class SGCV:
              sg.Column(self.right_layout)]
         ]
 
-        print("[DEBUG] 准备创建 Window")
         self.window = sg.Window('手势动作检测', layout, size=(1100, 650), resizable=True)
-        print("[DEBUG] Window 创建成功")
 
         # ---- 摄像头 ----
-        print("[DEBUG] 初始化摄像头")
         self.cap = cv2.VideoCapture(self.cameras[0], cv2.CAP_DSHOW)
-        print(f"[DEBUG] 摄像头打开状态: {self.cap.isOpened()}")
 
         # ---- 检测器 ----
-        print("[DEBUG] 初始化 Detector")
         self.detector = Detector()
-        print("[DEBUG] Detector 初始化完成")
 
-        # ---- 动作标签（与 gestures.json 保持一致） ----
+        # ---- 手势检测状态（二进制计数模式）/ Gesture detection state ----
         cfg = load_config()
-        self.actions = np.array(cfg["actions"])
+        self.smoother = LandmarkSmoother(alpha=cfg["smoother_alpha"])
+        self.finger_debouncer = FingerDebouncer(
+            window_size=cfg["finger_debounce_window"],
+            threshold=cfg["finger_debounce_threshold"])
+        self.ok_dist_threshold = cfg["ok_dist_threshold"]
+        self._current_handedness = None
 
-        # ---- 手势稳定性判断（置信度 + 滑动投票） ----
-        self.smoother = LandmarkSmoother(alpha=0.3)
-        self.vote_window = deque(maxlen=15)
-        self.vote_need = 10
-        self.conf_threshold = 0.70
-        self.last_confirmed_id = -1
-        self.current_stable_id = -1
-
-        # ---- 模型 ----
-        model_file = self._resource_path(cfg["model_path"])
-        print(f"[DEBUG] 模型路径: {model_file}")
-        if os.path.isfile(model_file):
-            self.model = tf.keras.models.load_model(model_file)
-            print("[DEBUG] 模型加载成功")
-        else:
-            print("[DEBUG] 模型文件不存在，跳过加载")
-            self.model = None
+        # ---- 数值稳定性 / Value stability ----
+        # 连续 N 帧输出相同 UART 字符才确认发送
+        self._stable_candidate = None
+        self._stable_count = 0
+        self._stable_need = cfg["value_stable_need"]
+        self._last_confirmed_char = None
 
         # ---- UART 通信状态 ----
         self.serial_port = None
@@ -122,8 +113,16 @@ class SGCV:
         self.uart_ack_received = True
         self.uart_send_time = 0
         self.uart_ack_timeout = 0.2       # 200 ms ACK 超时
+        self._uart_warned = False          # 是否已打印过"未连接"警告
 
-        print("[DEBUG] __init__ 完成，准备进入 run()")
+        # ---- 列出可用串口 / List available serial ports ----
+        ports = serial.tools.list_ports.comports()
+        if ports:
+            print(f"[UART] 检测到 {len(ports)} 个串口:")
+            for p in ports:
+                print(f"  - {p.device}  {p.description}")
+        else:
+            print("[UART] ⚠ 未检测到任何串口！请确认 MCU 已通过 USB 连接")
 
     def _get_cam_num(self):
         cams = []
@@ -150,36 +149,19 @@ class SGCV:
         base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(base, relative_path)
 
-    def _reset_vote_state(self, clear_confirmed=False):
-        self.vote_window.clear()
-        self.current_stable_id = -1
+    def _reset_gesture_state(self):
+        """重置所有手势检测状态 / Reset all gesture detection state"""
         self.smoother.reset()
-        if clear_confirmed:
-            self.last_confirmed_id = -1
+        self.finger_debouncer.reset()
+        self._current_handedness = None
+        self._stable_candidate = None
+        self._stable_count = 0
+        self._last_confirmed_char = None
 
     # ==================== UART 通信 ====================
 
-    @staticmethod
-    def act_id_to_uart_char(act_id):
-        """手势类别 → UART ASCII 字符映射
-
-        类别 0-8 (one..nine) → '1'-'9'
-        类别 9 (ten/fist)   → '0'
-        类别 12 (ok)        → 'K'
-        类别 10,11 (good/not good) → None (MCU 无对应动作)
-        """
-        if act_id is None:
-            return None
-        if 0 <= act_id <= 8:
-            return chr(ord('1') + act_id)   # 0->'1', 1->'2', ..., 8->'9'
-        elif act_id == 9:
-            return '0'                       # ten/fist -> digit 0
-        elif act_id == 12:
-            return 'K'                       # ok gesture
-        return None                          # good, not good, invalid -> no action
-
     def uart_connect(self, port_name):
-        """打开串口连接"""
+        """打开串口连接 / Open serial port connection"""
         try:
             self.serial_port = serial.Serial(
                 port=port_name,
@@ -193,11 +175,12 @@ class SGCV:
             self.uart_connected = True
             self.uart_last_sent_char = None
             self.uart_ack_received = True
+            self._uart_warned = False
         except serial.SerialException as e:
             sg.popup('串口连接失败: {}'.format(e), title='UART 错误')
 
     def uart_disconnect(self):
-        """关闭串口连接"""
+        """关闭串口连接 / Close serial port connection"""
         if self.serial_port is not None and self.serial_port.is_open:
             try:
                 self.serial_port.close()
@@ -218,6 +201,11 @@ class SGCV:
           - 超时（>200 ms）未收到 ACK：重发
         """
         if not self.uart_connected:
+            # 只在首次有确认手势但未连接时提醒一次
+            if current_char is not None and not self._uart_warned:
+                print(f"[UART] ⚠ 未连接串口，无法发送 '{current_char}' "
+                      f"— 请在左侧选择 COM 口并点击「连接」")
+                self._uart_warned = True
             return
 
         # 无映射手势，不发送
@@ -228,6 +216,7 @@ class SGCV:
 
         # 新手势或 ACK 已收到 -> 发送
         if current_char != self.uart_last_sent_char or self.uart_ack_received:
+            print(f"[UART] 发送: '{current_char}' (0x{ord(current_char):02X})")
             try:
                 self.serial_port.write(current_char.encode('ascii'))
             except serial.SerialException:
@@ -255,73 +244,127 @@ class SGCV:
                     pass
                 self.uart_send_time = time.time()
 
-    # ==================== 预测 ====================
+    # ==================== 手势检测（二进制计数） ====================
 
-    def _predict_action(self, frame):
-        """ 平滑 + 腕部归一化 + 置信度门槛 + 滑动投票
-        返回 (frame, act_id)，act_id 为 None 表示无确认手势
+    @staticmethod
+    def _binary_to_uart_char(value):
         """
-        if not self.detec_hand or self.model is None:
-            self._reset_vote_state(clear_confirmed=True)
+        二进制计数值 → UART ASCII 字符映射
+        / Binary finger count value -> UART ASCII character mapping.
+
+        0 (拳头/fist)    → '0'  (兼容旧的 ten/fist 手势)
+        1-9              → '1'-'9'
+        10               → '0'  (十 / digit 10 shows as 0)
+        11-31            → None (MCU 无对应显示)
+
+        OK 手势单独处理，不经过此函数。
+        / OK gesture is handled separately; does not go through this function.
+
+        手指位权：拇指=1, 食指=2, 中指=4, 无名指=8, 小指=16
+        / Finger bit weights: thumb=1, index=2, middle=4, ring=8, pinky=16
+        """
+        if 1 <= value <= 9:
+            return chr(ord('0') + value)   # 1->'1', 2->'2', ..., 9->'9'
+        elif value == 0 or value == 10:
+            return '0'
+        return None
+
+    def _stabilize_value(self, uart_char):
+        """
+        连续帧稳定性确认：同一字符连续出现 N 帧才确认。
+        / Consecutive-frame stability: same char for N frames to confirm.
+
+        返回确认的字符，未确认时返回上次确认的字符。
+        / Returns confirmed char; if not yet confirmed, returns last confirmed char.
+        """
+        if uart_char == self._stable_candidate:
+            self._stable_count += 1
+        else:
+            self._stable_candidate = uart_char
+            self._stable_count = 1
+
+        if self._stable_count >= self._stable_need:
+            self._last_confirmed_char = uart_char
+
+        return self._last_confirmed_char
+
+    def _detect_gesture(self, frame):
+        """
+        平滑 → 手指状态 → 去抖 → OK手势检测 → 二进制计数 → 稳定性确认
+        / Smooth → finger states → debounce → OK check → binary count → stabilize
+
+        返回 (frame, uart_char)，uart_char 为 None 表示无确认手势
+        / Returns (frame, uart_char); uart_char is None if no confirmed gesture
+        """
+        if not self.detec_hand:
+            self._reset_gesture_state()
             return frame, None
 
-        hand = select_primary_hand(self.detector.results)
+        # ---- 选择主手 / Select primary hand ----
+        hand, handedness = select_primary_hand(self.detector.results)
         if hand is None:
-            self._reset_vote_state(clear_confirmed=True)
+            self._reset_gesture_state()
             return frame, None
 
-        x = self.smoother.to_features(hand).reshape(1, -1)
-        y = self.model.predict(x, verbose=0)
-        act_id = int(np.argmax(y[0]))
-        conf = float(np.max(y[0]))
-        num_classes = int(y.shape[-1])
+        # ---- 手型切换时重置平滑器和去抖器 ----
+        # / Reset smoother and debouncer when handedness changes
+        if handedness != self._current_handedness:
+            self._current_handedness = handedness
+            self.smoother.reset()
+            self.finger_debouncer.reset()
 
-        if num_classes != len(self.actions) or not (0 <= act_id < len(self.actions)):
-            cv2.putText(frame, 'Model/label mismatch, retrain', (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return frame, None
+        # ---- EMA 关键点平滑 / EMA landmark smoothing ----
+        smoothed = self.smoother.update(hand)  # 21×3 numpy array
 
-        if conf < self.conf_threshold:
-            cv2.putText(frame, f'Unsure  {conf:.2f}', (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
-            cv2.putText(frame, f'Votes: {len(self.vote_window)}/{self.vote_window.maxlen}', (10, 70),
+        # ---- 手指状态检测 / Finger state detection ----
+        raw_states = get_finger_states(smoothed, handedness)
+
+        # ---- 每指独立去抖 / Per-finger debounce ----
+        debounced = self.finger_debouncer.update(raw_states)
+
+        # ---- 计算二进制值 / Compute binary value ----
+        binary_value = (debounced[0] * 1 + debounced[1] * 2 +
+                        debounced[2] * 4 + debounced[3] * 8 +
+                        debounced[4] * 16)
+
+        # ---- OK 手势优先检测 / OK gesture takes priority ----
+        is_ok = detect_ok_gesture(smoothed, debounced, self.ok_dist_threshold)
+        if is_ok:
+            uart_char = 'K'
+        else:
+            uart_char = self._binary_to_uart_char(binary_value)
+
+        # ---- 连续帧稳定性确认 / Consecutive-frame stability ----
+        confirmed_char = self._stabilize_value(uart_char)
+
+        # ---- 画面叠加信息 / Visual overlay ----
+        finger_names = ['T', 'I', 'M', 'R', 'P']
+        state_str = ' '.join(f'{n}:{"↑" if s else "·"}' for n, s in zip(finger_names, debounced))
+        cv2.putText(frame, f'Fingers: {state_str}', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        if is_ok:
+            cv2.putText(frame, 'Gesture: OK', (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        elif uart_char is not None:
+            cv2.putText(frame, f'Value: {binary_value} -> UART: {uart_char}', (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            cv2.putText(frame, f'Value: {binary_value} (unmapped)', (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+        if confirmed_char is not None:
+            cv2.putText(frame, f'Confirmed: {confirmed_char}', (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            return frame, None
 
-        self.vote_window.append(act_id)
-        votes = list(self.vote_window)
-        vote_counts = np.bincount(votes, minlength=len(self.actions))
-        top_id = int(np.argmax(vote_counts))
-        top_votes = int(vote_counts[top_id])
-        self.current_stable_id = top_id
-
-        # 投票达标且与上次确认不同 → 确认新手势
-        confirmed_id = None
-        if top_votes >= self.vote_need and top_id != self.last_confirmed_id:
-            confirmed_id = top_id
-            self.last_confirmed_id = top_id
-            gesture_name = self.actions[top_id]
-            print(f"[确认手势] id: {top_id}, 名称: {gesture_name}")
-
-        # 画面叠加信息
-        gesture_name = self.actions[act_id]
-        progress = min(top_votes / self.vote_need * 100, 100)
-        cv2.putText(frame, f'Action: {gesture_name}  {conf:.2f}', (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.putText(frame, f'Vote: {self.actions[top_id]} {int(progress)}% ({top_votes}/{self.vote_need})', (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-        # 返回当前稳定的手势 id（用于 UART 发送），不在此处发串口
-        return frame, self.last_confirmed_id if self.last_confirmed_id >= 0 else None
+        return frame, confirmed_char
 
     # ==================== 主循环 ====================
 
     def run(self):
-        print("[DEBUG] run() 开始")
         while True:
             event, value = self.window.read(timeout=40)
             if event == sg.WIN_CLOSED or event == 'exit':
-                print("[DEBUG] 退出事件")
                 self.uart_disconnect()
                 break
 
@@ -380,10 +423,8 @@ class SGCV:
                         frame = cv2.flip(frame, 1)
                     if self.detec_hand:
                         frame = self.detector.runDetec(frame)
-                        # 预测 + 投票，返回稳定手势 id
-                        frame, act_id = self._predict_action(frame)
-                        # 映射为 UART ASCII 字符并通过 ACK 流控发送
-                        uart_char = self.act_id_to_uart_char(act_id)
+                        # 手势检测：手指状态 → OK/二进制计数 → 稳定性确认 → UART 字符
+                        frame, uart_char = self._detect_gesture(frame)
                         self.uart_process(uart_char)
                     if self.is_record:
                         self.video_out.write(frame)
@@ -392,16 +433,13 @@ class SGCV:
                     _, buf = cv2.imencode('.png', frame)
                     self.window['image'].update(data=buf.tobytes())
 
-        print("[DEBUG] 清理资源")
         if self.cap:
             self.cap.release()
         if self.video_out:
             self.video_out.release()
         self.window.close()
-        print("[DEBUG] 程序结束")
 
 
 if __name__ == '__main__':
-    print("[DEBUG] 程序启动")
     app = SGCV()
     app.run()

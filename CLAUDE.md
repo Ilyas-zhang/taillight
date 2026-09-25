@@ -13,7 +13,7 @@ This is a **TI Code Composer Studio (Theia-based)** project — there is no stan
 - **Build (CLI):** `cd Debug && gmake all` — requires CCS toolchain at `E:/exe/ccs/ide/ccs/tools/compiler/ti-cgt-armllvm_4.0.4.LTS/bin/`
 - **Build (IDE):** CCS Theia → Project → Build All
 - **Flash/Debug:** CCS Debug perspective, using `targetConfigs/MSPM0G3507.ccxml` (XDS110 SWD probe)
-- **Output:** `Debug/taillight.out` (ELF) + `Debug/taillight.hex` (Intel HEX)
+- **Output:** `Debug/taillight.out` (ELF); map at `Debug/taillight.map`
 - **No test framework, no CI, no linter** beyond `-Wall`
 
 ## Toolchain & SDK
@@ -29,7 +29,7 @@ This is a **TI Code Composer Studio (Theia-based)** project — there is no stan
 Source is organized under `user/` with three layers. CCS includes are configured so that `user/driver/inc/`, `user/gesture/inc/`, and `user/app/inc/` are on the include path.
 
 ```
-main.c                          entry point (UART-driven main loop)
+main.c                          entry point (UART-driven main loop, __WFI idle)
 user/driver/                    WS2815B hardware driver (DMA/PWM + color buffers) + UART comm
   inc/ws2815_types.h            pure types, color macros, chain enum — no hw deps
   inc/ws2815.h                  driver API (includes ws2815_types.h + ti_msp_dl_config.h)
@@ -47,6 +47,7 @@ user/gesture/                   gesture & digit mask data (pure data, no hw deps
 user/app/                       taillight effect functions
   inc/taillight_app.h           effect API declarations
   src/taillight_app.c           palette fill, scan, breathe, digit display, process_command
+user/gesture_detect/            PC-side gesture detection (Python — see its own CLAUDE.md)
 ```
 
 Plus CCS boilerplate at the repo root:
@@ -117,7 +118,9 @@ Character mapping:
 
 ### DMA Protocol
 
-Each timer ZERO event triggers a single DMA byte transfer into the timer's CC register — the byte IS the PWM compare value encoding one WS2815 bit. Three trailing dummy zero bytes hold the line low for reset. `ws2815_wait_idle()` ensures ≥280 µs RESET latch. `DMA_IRQHandler` stops both timers only after all three channels complete.
+Each timer ZERO event triggers a single DMA byte transfer into the timer's CC register — the byte IS the PWM compare value encoding one WS2815 bit. Three trailing dummy zero bytes hold the line low for reset. `ws2815_wait_idle()` ensures ≥300 µs RESET latch (constant `WS2815_RESET_US`, exceeding the WS2815B minimum of 280 µs). `DMA_IRQHandler` stops both timers only after all three channels complete.
+
+**Per-chain DMA buffer size:** `LED_COUNT × 24 + 3` bytes (24 bits per GRB888 LED + 3 dummy zero bytes for reset). Total SRAM for all three buffers: 1083 + 1083 + 243 = 2409 bytes.
 
 ### Driver API (`ws2815.h`)
 
@@ -127,20 +130,38 @@ Each timer ZERO event triggers a single DMA byte transfer into the timer's CC re
 - 13 GRB888 color macros; colors packed GRB888 (bits [23:16]=G, [15:8]=R, [7:0]=B)
 - LED counts: `WS2815_LIFT_LED_NUM=45`, `RIGHT=45`, `STOP=10`, `TOTAL=100`
 
+### Main Loop
+
+The `main()` loop uses `__WFI()` (Wait For Interrupt) between UART polls — the CPU sleeps in low-power mode and wakes on UART0 RX or DMA interrupts. There is no RTOS; all scheduling is interrupt-driven.
+
+**Delay macro:** `LED_DELAY_MS(ms)` expands to `DL_Common_delayCycles(ms × 80000)` (busy-wait at 80 MHz MCLK). Defined identically in both `main.c` and `taillight_app.c` — if you change one, change both.
+
+### PC-Side Gesture Detection (`user/gesture_detect/`)
+
+A Python application (MediaPipe + PySimpleGUI) that detects hand gestures via webcam and sends the corresponding UART character to the MCU. Uses **binary finger counting** for digits (no ML model required) and **geometric detection** for OK gesture. It has its own `CLAUDE.md` with full details. Key points:
+
+- **Entry point:** `python CVideo.py` (requires Python 3.9+, venv at `taillight/`)
+- **Data flow:** Camera → MediaPipe landmarks → EMA smoothing → finger state detection → per-finger debounce → OK geometric check / binary counting → value stabilization → UART char send
+- **Binary counting:** Thumb=1, Index=2, Middle=4, Ring=8, Pinky=16; digit = sum of raised fingers
+- **UART:** COM port selectable in GUI, 115200 baud, ACK-based (`'#'` from MCU stops re-send)
+- **Config:** `config.json` for detection thresholds (OK distance, debounce params, smoother alpha)
+- **No TensorFlow dependency** — removed in binary counting refactoring
+- **No training required** — binary counting and geometric OK detection are deterministic
+
 ### Gesture & Digit System
 
 The gesture layer defines **per-chain color palettes** (`ws2815_gesture_t`) and **LED index masks** (`ws2815_digit_mask_t`, `ws2815_digit_mask_pair_t`). Effects receive gesture pointers so palettes are data-driven, not hardcoded.
 
 - **Digit display**: 10 digit mask pairs (0–9) in `ws2815_digit_masks[]`, each with independent left (LIFT) and right (RIGHT) masks. `taillight_show_digit(digit, side, color)` paints a digit on one side only.
 - **OK gesture**: `ws2815_gesture_ok` mask pair, displayed via `taillight_show_ok(side, color)`.
-- **Rainbow-breathe**: `taillight_digit_rainbow_breathe()` cycles digits 0–9 then OK, with flowing rainbow colors and breathing brightness. STOP chain breathes blue (digits) or yellow-red warm (OK).
+- **Rainbow-breathe**: `taillight_digit_rainbow_breathe()` cycles digits 0–9 then OK, with flowing rainbow colors and breathing brightness. STOP chain breathes blue (digits) or yellow-red warm (OK). **Warning:** this function contains an infinite `while(1)` loop — it must never be called from the UART command loop.
 - **Legacy compat**: `ws2815_gesture_digits` combines gesture + single-digit masks for `taillight_display_digits()`.
 
 ## LED Physical Layout
 
 ### PCB Regions
 
-The PCB (see `pcb.png`, 800×448) has a natural **X=350 vertical boundary** separating left and right LED regions, and a **Y≈90 horizontal boundary** within the left region separating STOP from LIFT:
+The PCB has a natural **X=350 vertical boundary** separating left and right LED regions, and a **Y≈90 horizontal boundary** within the left region separating STOP from LIFT:
 
 | Region | X range | Y range | Chain | LED Count |
 |---|---|---|---|---|
@@ -150,7 +171,7 @@ The PCB (see `pcb.png`, 800×448) has a natural **X=350 vertical boundary** sepa
 
 ### Taillight Housing Mapping
 
-When assembled into the housing (see `light.jpg`), the three PCB regions map to functional zones separated by horizontal dividers:
+When assembled into the housing, the three PCB regions map to functional zones separated by horizontal dividers:
 
 | PCB Region | Housing Zone | Lens/Reflector |
 |---|---|---|
@@ -227,3 +248,7 @@ The reversal on the LIFT side exists because the clockwise-outward spiral means 
 - **clangd:** `.clangd` points at `Debug/.clangd/compile_commands.json` (auto-generated by CCS, not for source control).
 - **Git:** The repo root is `D:/data/code/ccs/`; this project is `taillight/` within it.
 - **Layer separation:** Gesture and app layers include only `ws2815_types.h` (no hardware headers). New gesture data files should stay hw-free; only `ws2815.c` and `ti_msp_dl_config.c` touch registers.
+- **Gitignored paths:** `Debug/`, `.settings/`, `.project`, `.cproject`, `targetConfigs/`, `user/gesture_detect/taillight/` — these are not in source control.
+- **Linker memory:** FLASH 0x00000000 (128K), SRAM 0x20200000 (32K), 512-byte stack. Additional BCR_CONFIG (0x41C00000) and BSL_CONFIG (0x41C00100) regions exist for boot configuration but are unused in normal application code.
+- **Error handling:** Silent bounds-checking throughout — out-of-range indices are dropped, invalid UART chars are ignored (display unchanged). No asserts, no error codes, no logging on the MCU. Unhandled interrupts hit `Default_Handler` (infinite loop) — this is the only "crash" mechanism.
+- **ISR safety:** UART ACK (`'#'`) is sent from inside the RX ISR. DMA IRQ clears busy flag and stops timers. Neither ISR calls into the driver API — they only set flags / write registers.

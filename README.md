@@ -2,7 +2,7 @@
 
 Bare-metal embedded C firmware for **TI MSPM0G3507** (ARM Cortex-M0+, 128 KB flash / 32 KB SRAM) driving three WS2815B addressable RGB LED chains for a vehicle taillight (LIFT / RIGHT-turn / STOP lights). Uses timer PWM + DMA for bit-banging the WS2815 protocol.
 
-A PC-side gesture detection app communicates with the MCU via UART, sending detected hand gestures (digits 0–9 and OK) to drive LED display patterns.
+A PC-side gesture detection app communicates with the MCU via UART, sending detected hand gestures (digits 0–9 and OK) to drive LED display patterns. Digits use **binary finger counting** — no ML model or training required.
 
 ## Hardware
 
@@ -36,6 +36,36 @@ PC gesture detection  ──'1'-'9','0','K'──▶  MCU UART0 RX ISR
 | Fist (zero) | `'0'` | Digit 0 on both sides |
 | OK | `'K'` | OK gesture on both sides (cyan), STOP yellow |
 
+## Binary Finger Counting
+
+Digit gestures use binary counting — each finger is a bit:
+
+| Finger | Bit | Value |
+|---|---|---|
+| Thumb | 0 | 1 |
+| Index | 1 | 2 |
+| Middle | 2 | 4 |
+| Ring | 3 | 8 |
+| Pinky | 4 | 16 |
+
+**Digit = sum of raised finger values.** Examples:
+
+| Fingers raised | Binary | Value | UART char |
+|---|---|---|---|
+| Fist (none) | 00000 | 0 | `'0'` |
+| Thumb | 00001 | 1 | `'1'` |
+| Index | 00010 | 2 | `'2'` |
+| Thumb + Index | 00011 | 3 | `'3'` |
+| Middle | 00100 | 4 | `'4'` |
+| Thumb + Middle | 00101 | 5 | `'5'` |
+| Index + Middle | 00110 | 6 | `'6'` |
+| Thumb + Index + Middle | 00111 | 7 | `'7'` |
+| Ring | 01000 | 8 | `'8'` |
+| Thumb + Ring | 01001 | 9 | `'9'` |
+| Index + Ring | 01010 | 10 | `'0'` (ten) |
+
+OK gesture is detected geometrically (thumb tip + index tip form a circle, other 3 fingers extended).
+
 ## Build & Flash
 
 This is a **TI Code Composer Studio (Theia-based)** project.
@@ -43,7 +73,7 @@ This is a **TI Code Composer Studio (Theia-based)** project.
 - **IDE:** CCS Theia → Project → Build All
 - **CLI:** `cd Debug && gmake all` (requires CCS toolchain)
 - **Flash:** CCS Debug perspective, XDS110 SWD probe
-- **Output:** `Debug/taillight.out` + `Debug/taillight.hex`
+- **Output:** `Debug/taillight.out` (ELF)
 
 ## Project Structure
 
@@ -62,9 +92,11 @@ user/gesture/                   Gesture & digit mask data
 user/app/                       Taillight effect functions
   src/taillight_app.c           process_command, palette fill, scan, breathe
 user/gesture_detect/            PC-side gesture detection (Python)
-  CVideo.py                     PySimpleGUI app + UART integration
+  CVideo.py                     PySimpleGUI app + binary finger counting + UART
   hand.py                       MediaPipe hand detector
-  requirements.txt              Python dependencies
+  landmarks.py                  Finger state, OK detection, debounce
+  config.json                   Detection parameters (thresholds)
+  requirements.txt              Python dependencies (no TensorFlow)
 ti_msp_dl_config.h/.c           Hand-written device config (no SysConfig)
 ```
 
@@ -72,13 +104,18 @@ ti_msp_dl_config.h/.c           Hand-written device config (no SysConfig)
 
 ```bash
 cd user/gesture_detect
-python -m venv .venv           # requires Python 3.10
-.venv/Scripts/activate         # Windows
+python -m venv taillight       # requires Python 3.9+
+taillight/Scripts/activate     # Windows
 pip install -r requirements.txt
 python CVideo.py
 ```
 
-In the GUI: select COM port → Connect → enable 手势 checkbox → show gestures to camera.
+In the GUI:
+1. Select COM port → **连接**
+2. Check **手势** checkbox
+3. Show hand gestures to camera — digits display automatically
+
+**No training or data collection needed.** Binary finger counting is deterministic.
 
 ## Conventions
 

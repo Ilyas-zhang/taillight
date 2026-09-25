@@ -11,11 +11,12 @@ targetConfigs/
 # Python
 __pycache__/
 *.pyc
-.venv/
 
-# Gesture detect - large binary files
-user/gesture_detect/Model/
-user/gesture_detect/Data/
+# Gesture detect
+user/gesture_detect/taillight/
 user/gesture_detect/build/
 user/gesture_detect/image/
-user/gesture_detect/.venv/
+user/gesture_detect/error.log
+
+# Videos
+user/video/

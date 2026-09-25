@@ -92,6 +92,17 @@ class Detector:
     def fingersIsUp(self) -> list:
         """
         返回竖起和弯曲的手指列表,1表示竖起,0表示弯曲
+
+        .. deprecated::
+            实时检测管线已改用 landmarks.get_finger_states()，
+            后者直接基于归一化关键点工作，无需调用 getBox()。
+            本方法保留仅供 __main__ 独立测试使用。
+
+        / Return finger up/down list: 1=up, 0=curled.
+        .. deprecated::
+            Live pipeline now uses landmarks.get_finger_states() which works
+            on normalized landmarks without needing getBox().
+            This method is kept for __main__ standalone testing only.
         """
         multi_fingers = []
         if not self.results or not self.results.multi_hand_landmarks:

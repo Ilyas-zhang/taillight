@@ -83,6 +83,7 @@ workspace.xml
 .idea/workspace.xml
 # Environments
 .env
+taillight/
 .venv
 env/
 venv/
@@ -104,3 +105,4 @@ venv.bak/
 .mypy_cache/
 
 videos/
+error.log
