@@ -4,9 +4,6 @@ Debug/
 # CCS IDE
 .clangd/
 .settings/
-.project
-.cproject
-targetConfigs/
 
 # Python
 __pycache__/

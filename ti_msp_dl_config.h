@@ -2,7 +2,7 @@
  *  ============ ti_msp_dl_config.h =============
  *  MSPM0G3507 + WS2815 LED controller - device configuration declarations
  *
- *  Hand-written (no SysConfig) for the mspm0g3507_ws2815 project.
+ *  Hand-written (no SysConfig) for the taillight project.
  *
  *  Three WS2815 chains (physical wiring on the board):
  *    - LIFT : PA12 -> TIMG0_CCP0 -> DMA CH2  (45 LEDs)

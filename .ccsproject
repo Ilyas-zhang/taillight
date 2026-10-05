@@ -8,10 +8,10 @@
 	<executableActions value=""/>
 	<createSlaveProjects value=""/>
 	<ignoreDefaultCCSSettings value="true"/>
-	<templateProperties value="id=mspm0g3507_ws2815.projectspec.mspm0g3507_ws2815,buildProfile=release,isHybrid=true"/>
+	<templateProperties value="id=taillight.projectspec.taillight,buildProfile=release,isHybrid=true"/>
 	<activeTargetConfiguration value="targetConfigs/MSPM0G3507.ccxml"/>
 	<isTargetConfigurationManual value="false"/>
 	<sourceLookupPath value="${COM_TI_MSPM0_SDK_INSTALL_DIR}/source/ti/driverlib"/>
-	<origin value="E:\biSheng\files_09\mspm0g3507_ws2815_rev\mspm0g3507_ws2815.projectspec"/>
+	<origin value="E:\biSheng\files_09\taillight_rev\taillight.projectspec"/>
 	<filesToOpen value=""/>
 </projectOptions>
